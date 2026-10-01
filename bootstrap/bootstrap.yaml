@@ -1,0 +1,266 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  devops-04 bootstrap: bucket de artefatos, provider OIDC do GitHub, role do
+  pipeline e role de execução do CloudFormation.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: devops-04
+    AllowedPattern: "^[a-z0-9-]+$"
+    Description: Prefixo dos recursos. As permissões das roles são limitadas a ele.
+
+  AppStackName:
+    Type: String
+    Default: devops-04-app
+    Description: Nome da stack da aplicação que o pipeline pode atualizar.
+
+  GitHubRepository:
+    Type: String
+    Default: robson-devops/devops-04-serverless-finops
+    AllowedPattern: "^[^/]+/[^/]+$"
+    Description: Repositório (owner/nome) autorizado a assumir a role do pipeline.
+
+  GitHubBranch:
+    Type: String
+    Default: main
+    Description: Branch autorizada a assumir a role do pipeline.
+
+  CreateOidcProvider:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: >-
+      Cria o provider OIDC do GitHub (apagado junto com a stack). Use false se
+      a conta já tiver um; ele é único por conta.
+
+Conditions:
+  ShouldCreateOidcProvider: !Equals [!Ref CreateOidcProvider, "true"]
+
+Resources:
+  # Recebe o pacote da Lambda gerado pelo aws cloudformation package.
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_18
+            comment: Bucket de artefatos efêmeros; log de acesso exigiria um segundo bucket.
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: expira-artefatos
+            Status: Enabled
+            ExpirationInDays: 30
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 1
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  ArtifactBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ArtifactBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: s3:*
+            Resource:
+              - !GetAtt ArtifactBucket.Arn
+              - !Sub "${ArtifactBucket.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+  GitHubOidcProvider:
+    Type: AWS::IAM::OIDCProvider
+    Condition: ShouldCreateOidcProvider
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList:
+        - sts.amazonaws.com
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Assumida pelo CloudFormation ao criar a stack da aplicação. O pipeline não
+  # cria recursos: só pede o change set e entrega esta role.
+  CfnExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-cfn-execution"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudformation.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: app-resources
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: Functions
+                Effect: Allow
+                Action: lambda:*
+                Resource: !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${ProjectName}-*"
+              - Sid: FunctionRoles
+                Effect: Allow
+                Action:
+                  - iam:CreateRole
+                  - iam:DeleteRole
+                  - iam:GetRole
+                  - iam:PassRole
+                  - iam:UpdateAssumeRolePolicy
+                  - iam:PutRolePolicy
+                  - iam:GetRolePolicy
+                  - iam:DeleteRolePolicy
+                  - iam:AttachRolePolicy
+                  - iam:DetachRolePolicy
+                  - iam:TagRole
+                  - iam:UntagRole
+                  - iam:ListRoleTags
+                Resource: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${ProjectName}-*"
+              - Sid: Events
+                Effect: Allow
+                Action: events:*
+                Resource: !Sub "arn:${AWS::Partition}:events:${AWS::Region}:${AWS::AccountId}:rule/${ProjectName}-*"
+              - Sid: Schedules
+                Effect: Allow
+                Action: scheduler:*
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:scheduler:${AWS::Region}:${AWS::AccountId}:schedule/*/${ProjectName}-*"
+                  - !Sub "arn:${AWS::Partition}:scheduler:${AWS::Region}:${AWS::AccountId}:schedule-group/${ProjectName}-*"
+              - Sid: Storage
+                Effect: Allow
+                Action: s3:*
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:s3:::${ProjectName}-*"
+                  - !Sub "arn:${AWS::Partition}:s3:::${ProjectName}-*/*"
+              - Sid: Messaging
+                Effect: Allow
+                Action:
+                  - sns:*
+                  - sqs:*
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:sns:${AWS::Region}:${AWS::AccountId}:${ProjectName}-*"
+                  - !Sub "arn:${AWS::Partition}:sqs:${AWS::Region}:${AWS::AccountId}:${ProjectName}-*"
+              - Sid: Logs
+                Effect: Allow
+                Action: logs:*
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ProjectName}-*"
+                  - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ProjectName}-*:*"
+              - Sid: Alarms
+                Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricAlarm
+                  - cloudwatch:DeleteAlarms
+                  - cloudwatch:DescribeAlarms
+                  - cloudwatch:TagResource
+                  - cloudwatch:UntagResource
+                  - cloudwatch:ListTagsForResource
+                Resource: !Sub "arn:${AWS::Partition}:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:${ProjectName}-*"
+              # Estas APIs não aceitam restrição por recurso.
+              - Sid: ReadOnlyLookups
+                Effect: Allow
+                Action:
+                  - logs:DescribeLogGroups
+                  - kms:DescribeKey
+                  - kms:ListAliases
+                Resource: "*"
+
+  PipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-pipeline"
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !If
+                - ShouldCreateOidcProvider
+                - !Ref GitHubOidcProvider
+                - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com"
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+              # Formato clássico e formato com IDs imutáveis do "sub".
+              StringLike:
+                token.actions.githubusercontent.com:sub:
+                  - !Sub "repo:${GitHubRepository}:ref:refs/heads/${GitHubBranch}"
+                  - !Sub
+                    - "repo:${Owner}@*/${Name}@*:ref:refs/heads/${GitHubBranch}"
+                    - Owner: !Select [0, !Split ["/", !Ref GitHubRepository]]
+                      Name: !Select [1, !Split ["/", !Ref GitHubRepository]]
+      Policies:
+        - PolicyName: deploy-app-stack
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: AppStackChangeSets
+                Effect: Allow
+                Action:
+                  - cloudformation:CreateChangeSet
+                  - cloudformation:DescribeChangeSet
+                  - cloudformation:ExecuteChangeSet
+                  - cloudformation:DeleteChangeSet
+                  - cloudformation:ListChangeSets
+                  - cloudformation:DescribeStacks
+                  - cloudformation:DescribeStackEvents
+                  - cloudformation:GetTemplateSummary
+                Resource: !Sub "arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AppStackName}/*"
+              - Sid: UploadArtifacts
+                Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt ArtifactBucket.Arn
+                  - !Sub "${ArtifactBucket.Arn}/*"
+              - Sid: HandOverExecutionRole
+                Effect: Allow
+                Action: iam:PassRole
+                Resource: !GetAtt CfnExecutionRole.Arn
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: cloudformation.amazonaws.com
+
+Outputs:
+  ArtifactBucketName:
+    Description: Bucket onde o aws cloudformation package publica o código das funções
+    Value: !Ref ArtifactBucket
+  PipelineRoleArn:
+    Description: Role do GitHub Actions. Cadastre como secret AWS_ROLE_ARN no repositório
+    Value: !GetAtt PipelineRole.Arn
+  CfnExecutionRoleArn:
+    Description: Role que o CloudFormation assume para criar a stack da aplicação
+    Value: !GetAtt CfnExecutionRole.Arn

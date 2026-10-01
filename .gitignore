@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.coverage
+
+# Artefatos do aws cloudformation package
+.build/
+packaged*.yaml
+
+# Editores/SO
+.DS_Store
+.vscode/
+.idea/

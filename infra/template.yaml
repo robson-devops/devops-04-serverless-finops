@@ -1,0 +1,299 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  devops-04 app: relatórios de desperdício, conformidade de tags e
+  liga/desliga por horário, orientados a eventos.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: devops-04
+    AllowedPattern: "^[a-z0-9-]+$"
+    Description: Prefixo dos recursos. Precisa casar com o da stack de bootstrap.
+
+  AlertEmail:
+    Type: String
+    Default: ""
+    AllowedPattern: "^$|^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$"
+    Description: E-mail que recebe os resumos e alertas. Vazio não cria a assinatura.
+
+  SnapshotAgeDays:
+    Type: Number
+    Default: 90
+    MinValue: 1
+    Description: Snapshots mais antigos que isto entram no relatório de desperdício.
+
+  ScanSchedule:
+    Type: String
+    Default: cron(0 8 * * ? *)
+    Description: Quando a varredura roda, no fuso America/Sao_Paulo.
+
+  ReportRetentionDays:
+    Type: Number
+    Default: 30
+    MinValue: 1
+    Description: Dias até os relatórios expirarem no bucket.
+
+Conditions:
+  HasAlertEmail: !Not [!Equals [!Ref AlertEmail, ""]]
+
+Resources:
+  ReportBucket:
+    Type: AWS::S3::Bucket
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_18
+            comment: Relatórios efêmeros; log de acesso exigiria um segundo bucket.
+          - id: CKV_AWS_21
+            comment: Cada relatório tem nome único por data; não há sobrescrita a proteger.
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      LifecycleConfiguration:
+        Rules:
+          - Id: expira-relatorios
+            Status: Enabled
+            ExpirationInDays: !Ref ReportRetentionDays
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
+
+  ReportBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ReportBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: s3:*
+            Resource:
+              - !GetAtt ReportBucket.Arn
+              - !Sub "${ReportBucket.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+  # Sem SSE: alarmes do CloudWatch não publicam em tópico cifrado com a
+  # chave gerenciada aws/sns, e uma chave própria ficaria para trás no destroy.
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_26
+            comment: Ver README; mensagens são resumos sem dado sensível e trafegam por TLS.
+    Properties:
+      TopicName: !Sub "${ProjectName}-alerts"
+
+  AlertTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref AlertTopic
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: sns:Publish
+            Resource: !Ref AlertTopic
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+          - Sid: AllowCloudWatchAlarms
+            Effect: Allow
+            Principal:
+              Service: cloudwatch.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref AlertTopic
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+
+  AlertEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlertEmail
+    Properties:
+      TopicArn: !Ref AlertTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  # Eventos que as funções não conseguiram processar depois das tentativas.
+  DeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_27
+            comment: Cifrada com SqsManagedSseEnabled; o check só reconhece chave KMS.
+    Properties:
+      QueueName: !Sub "${ProjectName}-dlq"
+      SqsManagedSseEnabled: true
+      MessageRetentionPeriod: 1209600
+
+  # Uma role por função, com só o que ela usa.
+  WasteScannerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-waste-scanner"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: waste-scanner
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # APIs Describe não aceitam restrição por recurso.
+              - Sid: ReadInventory
+                Effect: Allow
+                Action:
+                  - ec2:DescribeVolumes
+                  - ec2:DescribeAddresses
+                  - ec2:DescribeSnapshots
+                  - ec2:DescribeInstances
+                  - logs:DescribeLogGroups
+                Resource: "*"
+              - Sid: WriteReport
+                Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub "${ReportBucket.Arn}/reports/*"
+              - Sid: Notify
+                Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref AlertTopic
+              - Sid: DeadLetter
+                Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt DeadLetterQueue.Arn
+              - Sid: OwnLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "${WasteScannerLogGroup.Arn}"
+
+  # Criado antes da função, com retenção; senão a Lambda cria um sem retenção.
+  WasteScannerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_158
+            comment: Cifrado com a chave gerenciada pela AWS; chave própria ficaria para trás no destroy.
+          - id: CKV_AWS_338
+            comment: Retenção curta de propósito; logs operacionais de um laboratório.
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ProjectName}-waste-scanner"
+      RetentionInDays: 7
+
+  WasteScannerFunction:
+    Type: AWS::Lambda::Function
+    Metadata:
+      # Code aponta para a pasta local; o aws cloudformation package troca pelo S3.
+      cfn-lint:
+        config:
+          ignore_checks: [W3002]
+      checkov:
+        skip:
+          - id: CKV_AWS_115
+            comment: Concorrência reservada pode falhar em conta nova (limite de 10); roda 1 vez por dia.
+          - id: CKV_AWS_117
+            comment: Só chama APIs públicas da AWS; dentro de uma VPC exigiria NAT ou endpoints pagos.
+          - id: CKV_AWS_173
+            comment: As variáveis de ambiente não têm segredo, só nomes de recursos.
+    Properties:
+      FunctionName: !Sub "${ProjectName}-waste-scanner"
+      Description: Procura recursos que geram custo sem uso e publica um relatório
+      Runtime: python3.13
+      Architectures: [arm64]
+      Handler: app.handler
+      Code: ../src/waste_scanner
+      MemorySize: 256
+      Timeout: 120
+      Role: !GetAtt WasteScannerRole.Arn
+      DeadLetterConfig:
+        TargetArn: !GetAtt DeadLetterQueue.Arn
+      LoggingConfig:
+        LogFormat: JSON
+        LogGroup: !Ref WasteScannerLogGroup
+      Environment:
+        Variables:
+          REPORT_BUCKET: !Ref ReportBucket
+          TOPIC_ARN: !Ref AlertTopic
+          SNAPSHOT_AGE_DAYS: !Ref SnapshotAgeDays
+
+  SchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-scheduler"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: invoke-functions
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt WasteScannerFunction.Arn
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt DeadLetterQueue.Arn
+
+  WasteScannerSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: !Sub "${ProjectName}-waste-scanner"
+      Description: Varredura diária de desperdício
+      ScheduleExpression: !Ref ScanSchedule
+      ScheduleExpressionTimezone: America/Sao_Paulo
+      FlexibleTimeWindow:
+        Mode: "OFF"
+      Target:
+        Arn: !GetAtt WasteScannerFunction.Arn
+        RoleArn: !GetAtt SchedulerRole.Arn
+        RetryPolicy:
+          MaximumRetryAttempts: 2
+        DeadLetterConfig:
+          Arn: !GetAtt DeadLetterQueue.Arn
+
+Outputs:
+  WasteScannerFunctionName:
+    Description: Função da varredura de desperdício
+    Value: !Ref WasteScannerFunction
+
+  ReportBucketName:
+    Description: Bucket dos relatórios de desperdício
+    Value: !Ref ReportBucket
+  AlertTopicArn:
+    Description: Tópico SNS dos resumos e alertas
+    Value: !Ref AlertTopic
+  DeadLetterQueueArn:
+    Description: Fila dos eventos que falharam
+    Value: !GetAtt DeadLetterQueue.Arn
