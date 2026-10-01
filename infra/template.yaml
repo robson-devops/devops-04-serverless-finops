@@ -32,6 +32,21 @@ Parameters:
     Default: Project,Environment,Owner
     Description: Tags que toda instância EC2 precisa ter, separadas por vírgula.
 
+  ScheduleTagValue:
+    Type: String
+    Default: office-hours
+    Description: Valor da tag Schedule que coloca a instância no liga/desliga por horário.
+
+  StopSchedule:
+    Type: String
+    Default: cron(0 20 ? * MON-FRI *)
+    Description: Quando parar as instâncias agendadas, no fuso America/Sao_Paulo.
+
+  StartSchedule:
+    Type: String
+    Default: cron(0 8 ? * MON-FRI *)
+    Description: Quando ligar as instâncias agendadas, no fuso America/Sao_Paulo.
+
   ReportRetentionDays:
     Type: Number
     Default: 30
@@ -266,7 +281,9 @@ Resources:
             Statement:
               - Effect: Allow
                 Action: lambda:InvokeFunction
-                Resource: !GetAtt WasteScannerFunction.Arn
+                Resource:
+                  - !GetAtt WasteScannerFunction.Arn
+                  - !GetAtt OfficeHoursFunction.Arn
               - Effect: Allow
                 Action: sqs:SendMessage
                 Resource: !GetAtt DeadLetterQueue.Arn
@@ -424,7 +441,134 @@ Resources:
               ArnEquals:
                 aws:SourceArn: !GetAtt InstanceRunningRule.Arn
 
+  OfficeHoursRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-office-hours"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: office-hours
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ReadInstances
+                Effect: Allow
+                Action: ec2:DescribeInstances
+                Resource: "*"
+              # Mesmo com bug no código, só alcança instâncias com a tag de agendamento.
+              - Sid: StopStartScheduledOnly
+                Effect: Allow
+                Action:
+                  - ec2:StopInstances
+                  - ec2:StartInstances
+                Resource: !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*"
+                Condition:
+                  StringEquals:
+                    aws:ResourceTag/Schedule: !Ref ScheduleTagValue
+              - Sid: DeadLetter
+                Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt DeadLetterQueue.Arn
+              - Sid: OwnLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "${OfficeHoursLogGroup.Arn}"
+
+  OfficeHoursLogGroup:
+    Type: AWS::Logs::LogGroup
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_158
+            comment: Cifrado com a chave gerenciada pela AWS; chave própria ficaria para trás no destroy.
+          - id: CKV_AWS_338
+            comment: Retenção curta de propósito; logs operacionais de um laboratório.
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ProjectName}-office-hours"
+      RetentionInDays: 7
+
+  OfficeHoursFunction:
+    Type: AWS::Lambda::Function
+    Metadata:
+      cfn-lint:
+        config:
+          ignore_checks: [W3002]
+      checkov:
+        skip:
+          - id: CKV_AWS_115
+            comment: Concorrência reservada pode falhar em conta nova (limite de 10).
+          - id: CKV_AWS_117
+            comment: Só chama APIs públicas da AWS; dentro de uma VPC exigiria NAT ou endpoints pagos.
+          - id: CKV_AWS_173
+            comment: As variáveis de ambiente não têm segredo.
+    Properties:
+      FunctionName: !Sub "${ProjectName}-office-hours"
+      Description: Para e liga por horário as instâncias com a tag Schedule
+      Runtime: python3.13
+      Architectures: [arm64]
+      Handler: app.handler
+      Code: ../src/office_hours
+      MemorySize: 128
+      Timeout: 60
+      Role: !GetAtt OfficeHoursRole.Arn
+      DeadLetterConfig:
+        TargetArn: !GetAtt DeadLetterQueue.Arn
+      LoggingConfig:
+        LogFormat: JSON
+        LogGroup: !Ref OfficeHoursLogGroup
+      Environment:
+        Variables:
+          SCHEDULE_TAG_VALUE: !Ref ScheduleTagValue
+
+  OfficeHoursStopSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: !Sub "${ProjectName}-office-hours-stop"
+      Description: Para as instâncias agendadas no fim do expediente
+      ScheduleExpression: !Ref StopSchedule
+      ScheduleExpressionTimezone: America/Sao_Paulo
+      FlexibleTimeWindow:
+        Mode: "OFF"
+      Target:
+        Arn: !GetAtt OfficeHoursFunction.Arn
+        RoleArn: !GetAtt SchedulerRole.Arn
+        Input: '{"action": "stop"}'
+        RetryPolicy:
+          MaximumRetryAttempts: 2
+        DeadLetterConfig:
+          Arn: !GetAtt DeadLetterQueue.Arn
+
+  OfficeHoursStartSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: !Sub "${ProjectName}-office-hours-start"
+      Description: Liga as instâncias agendadas no início do expediente
+      ScheduleExpression: !Ref StartSchedule
+      ScheduleExpressionTimezone: America/Sao_Paulo
+      FlexibleTimeWindow:
+        Mode: "OFF"
+      Target:
+        Arn: !GetAtt OfficeHoursFunction.Arn
+        RoleArn: !GetAtt SchedulerRole.Arn
+        Input: '{"action": "start"}'
+        RetryPolicy:
+          MaximumRetryAttempts: 2
+        DeadLetterConfig:
+          Arn: !GetAtt DeadLetterQueue.Arn
+
 Outputs:
+  OfficeHoursFunctionName:
+    Description: Função de liga/desliga por horário
+    Value: !Ref OfficeHoursFunction
+
   TagGuardFunctionName:
     Description: Função de conformidade de tags
     Value: !Ref TagGuardFunction
