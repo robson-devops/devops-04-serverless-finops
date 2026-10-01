@@ -1,10 +1,18 @@
+import importlib.util
 import os
-import sys
 from pathlib import Path
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src" / "waste_scanner"))
+SRC = Path(__file__).resolve().parents[1] / "src"
+
+
+def load_function(name):
+    """Carrega src/<name>/app.py com nome próprio; todas as funções usam app.py."""
+    spec = importlib.util.spec_from_file_location(f"{name}_app", SRC / name / "app.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 @pytest.fixture(autouse=True)

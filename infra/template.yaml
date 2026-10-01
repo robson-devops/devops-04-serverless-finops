@@ -27,6 +27,11 @@ Parameters:
     Default: cron(0 8 * * ? *)
     Description: Quando a varredura roda, no fuso America/Sao_Paulo.
 
+  RequiredTags:
+    Type: String
+    Default: Project,Environment,Owner
+    Description: Tags que toda instância EC2 precisa ter, separadas por vírgula.
+
   ReportRetentionDays:
     Type: Number
     Default: 30
@@ -283,7 +288,147 @@ Resources:
         DeadLetterConfig:
           Arn: !GetAtt DeadLetterQueue.Arn
 
+  TagGuardRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-tag-guard"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: tag-guard
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ReadInstances
+                Effect: Allow
+                Action: ec2:DescribeInstances
+                Resource: "*"
+              # Só consegue escrever a tag de conformidade, nenhuma outra.
+              - Sid: MarkNonCompliant
+                Effect: Allow
+                Action: ec2:CreateTags
+                Resource: !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*"
+                Condition:
+                  ForAllValues:StringEquals:
+                    aws:TagKeys: [TagCompliance]
+              - Sid: Notify
+                Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref AlertTopic
+              - Sid: DeadLetter
+                Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt DeadLetterQueue.Arn
+              - Sid: OwnLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "${TagGuardLogGroup.Arn}"
+
+  TagGuardLogGroup:
+    Type: AWS::Logs::LogGroup
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_158
+            comment: Cifrado com a chave gerenciada pela AWS; chave própria ficaria para trás no destroy.
+          - id: CKV_AWS_338
+            comment: Retenção curta de propósito; logs operacionais de um laboratório.
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ProjectName}-tag-guard"
+      RetentionInDays: 7
+
+  TagGuardFunction:
+    Type: AWS::Lambda::Function
+    Metadata:
+      cfn-lint:
+        config:
+          ignore_checks: [W3002]
+      checkov:
+        skip:
+          - id: CKV_AWS_115
+            comment: Concorrência reservada pode falhar em conta nova (limite de 10).
+          - id: CKV_AWS_117
+            comment: Só chama APIs públicas da AWS; dentro de uma VPC exigiria NAT ou endpoints pagos.
+          - id: CKV_AWS_173
+            comment: As variáveis de ambiente não têm segredo, só nomes de recursos.
+    Properties:
+      FunctionName: !Sub "${ProjectName}-tag-guard"
+      Description: Avisa quando uma instância EC2 sobe sem as tags obrigatórias
+      Runtime: python3.13
+      Architectures: [arm64]
+      Handler: app.handler
+      Code: ../src/tag_guard
+      MemorySize: 128
+      Timeout: 30
+      Role: !GetAtt TagGuardRole.Arn
+      DeadLetterConfig:
+        TargetArn: !GetAtt DeadLetterQueue.Arn
+      LoggingConfig:
+        LogFormat: JSON
+        LogGroup: !Ref TagGuardLogGroup
+      Environment:
+        Variables:
+          TOPIC_ARN: !Ref AlertTopic
+          REQUIRED_TAGS: !Ref RequiredTags
+
+  InstanceRunningRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${ProjectName}-instance-running"
+      Description: Instância EC2 entrou em execução
+      EventPattern:
+        source: [aws.ec2]
+        detail-type: [EC2 Instance State-change Notification]
+        detail:
+          state: [running]
+      Targets:
+        - Id: tag-guard
+          Arn: !GetAtt TagGuardFunction.Arn
+          RetryPolicy:
+            MaximumRetryAttempts: 2
+            MaximumEventAgeInSeconds: 3600
+          DeadLetterConfig:
+            Arn: !GetAtt DeadLetterQueue.Arn
+
+  TagGuardInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref TagGuardFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt InstanceRunningRule.Arn
+
+  # O EventBridge entrega na DLQ com a própria identidade, não com uma role.
+  DeadLetterQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref DeadLetterQueue
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowEventBridgeRules
+            Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt DeadLetterQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !GetAtt InstanceRunningRule.Arn
+
 Outputs:
+  TagGuardFunctionName:
+    Description: Função de conformidade de tags
+    Value: !Ref TagGuardFunction
+
   WasteScannerFunctionName:
     Description: Função da varredura de desperdício
     Value: !Ref WasteScannerFunction

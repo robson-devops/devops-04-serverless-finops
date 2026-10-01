@@ -4,7 +4,9 @@ from datetime import UTC, datetime, timedelta
 import boto3
 from moto import mock_aws
 
-import app
+from conftest import load_function
+
+app = load_function("waste_scanner")
 
 
 @mock_aws
