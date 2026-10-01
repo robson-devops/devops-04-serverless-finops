@@ -1,0 +1,7 @@
+# Ferramentas de validação usadas localmente e no pipeline. O boto3 do
+# runtime da Lambda já vem embutido; aqui ele chega como dependência do moto.
+moto[ec2,s3,sns,logs]==5.2.3
+pytest==9.1.1
+ruff==0.16.10
+cfn-lint==1.57.1
+checkov==3.3.22

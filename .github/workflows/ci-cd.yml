@@ -1,0 +1,107 @@
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "infra/**"
+      - "tests/**"
+      - "bootstrap/**"
+      - "pyproject.toml"
+      - "requirements-dev.txt"
+      - ".github/workflows/ci-cd.yml"
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  AWS_REGION: us-east-1
+  STACK_NAME: devops-04-app
+
+permissions:
+  contents: read
+
+# Um deploy por vez na mesma stack; o segundo espera o primeiro terminar.
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      - name: Ferramentas
+        run: pip install -r requirements-dev.txt
+
+      - name: Lint do código
+        run: |
+          ruff check .
+          ruff format --check .
+
+      - name: Testes
+        run: pytest -q
+
+      - name: Lint dos templates
+        run: cfn-lint bootstrap/bootstrap.yaml infra/template.yaml
+
+      - name: Segurança dos templates e do workflow
+        run: checkov -d . --framework cloudformation github_actions --quiet --compact
+
+  deploy:
+    needs: validate
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Assumir role na AWS via OIDC
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Empacotar as funções
+        env:
+          ARTIFACT_BUCKET: ${{ vars.ARTIFACT_BUCKET }}
+        run: |
+          mkdir -p .build
+          aws cloudformation package \
+            --template-file infra/template.yaml \
+            --s3-bucket "$ARTIFACT_BUCKET" \
+            --s3-prefix app \
+            --output-template-file .build/packaged.yaml
+
+      # O pipeline só pede o change set; quem cria os recursos é o
+      # CloudFormation, com a role de execução.
+      - name: Deploy
+        env:
+          CFN_EXECUTION_ROLE_ARN: ${{ vars.CFN_EXECUTION_ROLE_ARN }}
+        run: |
+          aws cloudformation deploy \
+            --template-file .build/packaged.yaml \
+            --stack-name "$STACK_NAME" \
+            --role-arn "$CFN_EXECUTION_ROLE_ARN" \
+            --capabilities CAPABILITY_NAMED_IAM \
+            --no-fail-on-empty-changeset
+
+      - name: Estado da stack
+        run: |
+          aws cloudformation describe-stacks \
+            --stack-name "$STACK_NAME" \
+            --query 'Stacks[0].[StackStatus,LastUpdatedTime]' \
+            --output text
