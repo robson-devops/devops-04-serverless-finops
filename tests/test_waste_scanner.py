@@ -71,3 +71,15 @@ def test_clean_account_sends_no_email(monkeypatch):
     result = app.handler({}, None)
 
     assert result["findings"] == 0
+
+
+def test_summary_shows_monthly_total():
+    findings = [
+        {"type": "t", "id": "a", "detail": "d", "monthly_usd": 1.5},
+        {"type": "t", "id": "b", "detail": "d", "monthly_usd": 2.25},
+    ]
+
+    subject, message, total = app.summary(findings, "us-east-1", "s3://b/k")
+
+    assert total == 3.75
+    assert "Total estimado: ~US$ 3.75/mês" in message

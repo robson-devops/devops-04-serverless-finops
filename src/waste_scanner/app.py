@@ -134,7 +134,7 @@ def summary(findings, region, report_key):
     lines = [f"Varredura de desperdício na região {region}.", ""]
     for f in findings:
         lines.append(f"- {f['type']}: {f['id']} ({f['detail']}) ~US$ {f['monthly_usd']:.2f}/mês")
-    lines += ["", f"Relatório completo: {report_key}"]
+    lines += ["", f"Total estimado: ~US$ {total:.2f}/mês", f"Relatório completo: {report_key}"]
     return subject, "\n".join(lines), total
 
 
